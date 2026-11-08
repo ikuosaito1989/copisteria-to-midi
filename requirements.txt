@@ -7,3 +7,4 @@ Pillow==11.1.0
 converter21==3.4.0
 loguru==0.7.3
 scikit-image==0.25.2
+opencv-python-headless==4.11.0.86
