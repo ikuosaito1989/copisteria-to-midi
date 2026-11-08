@@ -1,0 +1,12 @@
+services:
+  omr:
+    build: .
+    working_dir: /app
+    volumes:
+      - ./input:/input
+      - ./output:/output
+      - model-cache:/cache
+    environment:
+      HF_HOME: /cache/huggingface
+volumes:
+  model-cache:

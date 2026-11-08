@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+input/*
+!input/.gitkeep
+output/*
+!output/.gitkeep
+models/
+*.mid
+*.musicxml
+*.pt
+*.npz
+*.json
