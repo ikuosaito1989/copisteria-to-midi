@@ -101,9 +101,13 @@ def main() -> int:
         for page in range(1, count + 1):
             print(f"ページ {page}/{count} を認識中...", flush=True)
             page_out = temp / f"p{page:04d}"
-            env = os.environ.copy()
-            env["COPISTERIA_DETECTOR"] = args.model
-            subprocess.run([sys.executable, "-m", "copisteria.pipeline", "--pdf", str(src), "--range", str(page), "--out", str(page_out)], check=True, env=env)
+            subprocess.run([
+                sys.executable, "/app/src/run_copisteria.py",
+                "--model", args.model,
+                "--pdf", str(src),
+                "--page", str(page),
+                "--out", str(page_out),
+            ], check=True, env=os.environ.copy())
             candidates = list(page_out.glob("*.musicxml"))
             if len(candidates) != 1 or candidates[0].stat().st_size < 100:
                 raise ValueError(f"ページ{page}のMusicXMLが空、または曖昧です")
