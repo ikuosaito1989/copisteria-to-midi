@@ -1,3 +1,8 @@
 huggingface_hub==0.29.3
 music21==9.7.1
 pypdf==5.3.1
+transformers==4.49.0
+numpy<2
+Pillow==11.1.0
+converter21==3.4.0
+loguru==0.7.3

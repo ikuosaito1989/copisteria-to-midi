@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run copisteria on every page and convert the ordered score to MIDI."""
+"""Transcribe PDF score pages with SMT++ and export MusicXML and MIDI."""
 import argparse
 import os
 import shutil
@@ -8,68 +8,67 @@ import sys
 from pathlib import Path
 
 MODELS = {
-    "28m": ("small/v7_obj-recall-30m_best.pt", "copista-28m"),
-    "2m": ("small/v7_obj-recall_best.pt", "copista-2m"),
+    "grandstaff": "antoniorv6/smt-grandstaff",
+    "polish": "PRAIG/smt-fp-polish-scores",
 }
-EVIDENCE = "evidence-2m.pt"
-MODEL_REPOS = {"28m": "kobimusic/copista-28m", "2m": "kobimusic/copista-2m"}
 
 
-def ensure_models(size: str) -> None:
-    from huggingface_hub import hf_hub_download
-    from huggingface_hub.utils import HfHubHTTPError
-    root = Path("/opt/copisteria/models")
-    files = [EVIDENCE, MODELS[size][0]]
-    try:
-        for name in files:
-            dest = root / name
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            if not dest.is_file():
-                downloaded = hf_hub_download(repo_id=MODEL_REPOS[size], filename=name)
-                shutil.copy2(downloaded, dest)
-    except Exception as exc:
-        raise RuntimeError(f"モデルの取得に失敗しました ({MODEL_REPOS[size]}, {size}): {exc}") from exc
+def render_page(pdf: Path, page: int, target: Path) -> None:
+    subprocess.run([
+        "pdftoppm", "-f", str(page), "-l", str(page), "-r", "300",
+        "-gray", "-png", "-singlefile", str(pdf), str(target.with_suffix("")),
+    ], check=True, stdout=subprocess.DEVNULL)
 
 
-def merge_xmls(paths: list[Path], target: Path) -> None:
-    """Merge page scores by stable part position and append measures in PDF order."""
+def to_kern(tokens: list[str]) -> str:
+    text = "".join(token for token in tokens if token not in {"<pad>", "<bos>", "<eos>"})
+    text = text.replace("<t>", "\t").replace("<b>", "\n").replace("<s>", " ")
+    text = text.strip()
+    if not text:
+        raise ValueError("SMT++が空の譜面を返しました")
+    if "**bekern" in text:
+        text = text.replace("**bekern", "**kern")
+    elif "**kern" not in text:
+        text = "**kern\n" + text
+    if "*-" not in text:
+        text += "\n*-\n"
+    return text + ("" if text.endswith("\n") else "\n")
+
+
+def merge_scores(paths: list[Path], target: Path) -> None:
     from music21 import converter, stream
-    scores = [converter.parse(str(path)) for path in paths]
-    if not scores:
-        raise ValueError("MusicXMLが生成されませんでした")
-    base_parts = list(scores[0].parts)
-    if not base_parts:
-        raise ValueError("最初のページにパートがありません")
+
+    scores = [converter.parse(str(p), format="humdrum") for p in paths]
+    parts0 = list(scores[0].parts)
+    if not parts0:
+        raise ValueError("譜面パートを読み取れませんでした")
     merged = stream.Score()
-    out_parts = []
-    for idx, first in enumerate(base_parts):
-        part = stream.Part(id=first.id or f"P{idx + 1}")
+    for i, first in enumerate(parts0):
+        part = stream.Part(id=first.id or f"P{i + 1}")
         part.partName = first.partName
-        measure_number = 1
+        number = 1
         for page_no, score in enumerate(scores, 1):
             parts = list(score.parts)
-            if len(parts) != len(base_parts):
-                raise ValueError(f"ページ{page_no}のパート数({len(parts)})が先頭ページ({len(base_parts)})と一致しません")
-            # Page-local numbering can repeat. Retain physical measure order and renumber.
-            measures = list(parts[idx].getElementsByClass("Measure"))
+            if len(parts) != len(parts0):
+                raise ValueError(f"ページ{page_no}のパート数が他のページと一致しません")
+            measures = list(parts[i].getElementsByClass("Measure"))
             if not measures:
-                raise ValueError(f"ページ{page_no}のパート{idx + 1}に小節がありません")
+                raise ValueError(f"ページ{page_no}のパート{i + 1}に小節がありません")
             for measure in measures:
-                measure.number = measure_number
-                measure_number += 1
+                measure.number = number
+                number += 1
                 part.append(measure)
-        out_parts.append(part)
         merged.insert(0, part)
     target.parent.mkdir(parents=True, exist_ok=True)
     merged.write("musicxml", fp=str(target))
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="PDF楽譜をMusicXMLとMIDIに変換します (Docker Compose向け)")
+    ap = argparse.ArgumentParser(description="PDF楽譜をSMT++で認識し、MusicXMLとMIDIを作成します")
     ap.add_argument("score", nargs="?", help="/input内のPDF名、またはPDFパス")
-    ap.add_argument("--input", dest="input_path", help="入力PDFのパス")
-    ap.add_argument("--output", help="出力MIDIのパス (既定: /output/<入力名>.mid)")
-    ap.add_argument("--model", choices=MODELS, default="28m", help="認識モデル (既定: 28m)")
+    ap.add_argument("--input", dest="input_path", help="入力PDFパス")
+    ap.add_argument("--output", help="出力MIDIパス (既定: /output/<入力名>.mid)")
+    ap.add_argument("--model", choices=MODELS, default="grandstaff", help="SMT++チェックポイント (既定: grandstaff)")
     args = ap.parse_args()
     raw = args.input_path or args.score
     if not raw:
@@ -78,50 +77,57 @@ def main() -> int:
     if not src.is_absolute():
         src = Path("/input") / src
     src = src.resolve()
-    if not src.is_file():
-        print(f"エラー: 入力PDFが見つかりません: {src}", file=sys.stderr)
-        return 2
-    if src.suffix.lower() != ".pdf":
-        print("エラー: 入力ファイルはPDFである必要があります", file=sys.stderr)
+    if not src.is_file() or src.suffix.lower() != ".pdf":
+        print(f"エラー: PDFが見つからないか、PDFではありません: {src}", file=sys.stderr)
         return 2
     dest = Path(args.output) if args.output else Path("/output") / f"{src.stem}.mid"
-    xml_out = dest.with_suffix(".musicxml") if args.output else Path("/output") / f"{src.stem}.musicxml"
+    xml_out = dest.with_suffix(".musicxml")
     debug = dest.parent / "debug" / src.stem
+    temp = Path("/tmp/smt-midi-job")
     try:
         from pypdf import PdfReader
-        reader = PdfReader(str(src))
-        count = len(reader.pages)
-        if not count:
+        import numpy as np
+        import torch
+        from PIL import Image
+        from data_augmentation.data_augmentation import convert_img_to_tensor
+        from smt_model import SMTModelForCausalLM
+
+        count = len(PdfReader(str(src)).pages)
+        if count < 1:
             raise ValueError("PDFにページがありません")
-        ensure_models(args.model)
-        temp = Path("/tmp/copisteria-job")
+        model_id = os.environ.get(f"SMT_MODEL_{args.model.upper()}", MODELS[args.model])
+        print(f"SMT++ checkpoint: {model_id}", flush=True)
+        device = torch.device("cpu")
+        model = SMTModelForCausalLM.from_pretrained(model_id).to(device).eval()
+        maxh = int(model.config.maxh)
+        maxw = int(model.config.maxw)
         shutil.rmtree(temp, ignore_errors=True)
         temp.mkdir(parents=True)
-        xmls = []
+        kerns = []
         for page in range(1, count + 1):
             print(f"ページ {page}/{count} を認識中...", flush=True)
-            page_out = temp / f"p{page:04d}"
-            subprocess.run([
-                sys.executable, "/app/src/run_copisteria.py",
-                "--model", args.model,
-                "--pdf", str(src),
-                "--page", str(page),
-                "--out", str(page_out),
-            ], check=True, env=os.environ.copy())
-            candidates = list(page_out.glob("*.musicxml"))
-            if len(candidates) != 1 or candidates[0].stat().st_size < 100:
-                raise ValueError(f"ページ{page}のMusicXMLが空、または曖昧です")
-            xmls.append(candidates[0])
+            image_path = temp / f"page-{page:03d}.png"
+            render_page(src, page, image_path)
+            image = Image.open(image_path).convert("L")
+            scale = min(1.0, maxw / image.width, maxh / image.height)
+            if scale < 1:
+                image = image.resize((int(image.width * scale), int(image.height * scale)), Image.Resampling.LANCZOS)
+            tensor = convert_img_to_tensor(np.asarray(image)).unsqueeze(0).to(device)
+            with torch.inference_mode():
+                tokens, _ = model.predict(tensor, convert_to_str=True)
+            kern_path = temp / f"page-{page:03d}.krn"
+            kern_path.write_text(to_kern(tokens), encoding="utf-8")
+            kerns.append(kern_path)
         debug.mkdir(parents=True, exist_ok=True)
-        for n, x in enumerate(xmls, 1):
-            shutil.copy2(x, debug / f"page-{n:03d}.musicxml")
-        merge_xmls(xmls, xml_out)
+        for i, kern in enumerate(kerns, 1):
+            shutil.copy2(kern, debug / f"page-{i:03d}.krn")
+        merge_scores(kerns, xml_out)
         from music21 import converter
         score = converter.parse(str(xml_out))
-        midi = score.write("midi", fp=str(dest))
-        if not Path(midi).is_file() or not converter.parse(midi).recurse().notes:
-            raise ValueError("MIDIにノートイベントがありません")
-        print(f"完了: {dest}\nMusicXML: {xml_out}\nページ別XML: {debug}")
+        midi_path = Path(score.write("midi", fp=str(dest)))
+        if not midi_path.is_file() or not converter.parse(str(midi_path)).recurse().notes:
+            raise ValueError("出力MIDIにノートイベントがありません")
+        print(f"完了: {dest}\nMusicXML: {xml_out}\nページ別bekern: {debug}", flush=True)
         return 0
     except Exception as exc:
         print(f"変換エラー: {exc}", file=sys.stderr)

@@ -5,8 +5,8 @@ services:
     volumes:
       - ./input:/input
       - ./output:/output
-      - model-cache:/cache
+      - smt-model-cache:/cache
     environment:
       HF_HOME: /cache/huggingface
 volumes:
-  model-cache:
+  smt-model-cache:
